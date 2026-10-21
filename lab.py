@@ -47,11 +47,11 @@ def resolve_command(executable, windows=None):
     return [found_node, str(target)]
 
 
-def config(model, base_url, steps):
+def config(model, base_url, steps, variant="baseline"):
     selected = 'lab/' + model
     return {'$schema': 'https://opencode.ai/config.json', 'model': selected,
             'small_model': selected, 'default_agent': 'build', 'autoupdate': False,
-            'share': 'disabled', 'plugin': [], 'mcp': {}, 'instructions': [],
+            'share': 'disabled', 'plugin': [(ROOT / 'plugins/compact.mjs').as_uri()] if variant == 'compact' else [], 'mcp': {}, 'instructions': [],
             'lsp': False, 'formatter': False, 'permission': {'*': 'allow'},
             'agent': {'build': {'steps': steps}}, 'enabled_providers': ['lab'],
             'provider': {'lab': {'npm': '@ai-sdk/openai-compatible',
@@ -111,9 +111,11 @@ integers from stdin, remove duplicates, sort ascending, and output a JSON array
 of maximal inclusive consecutive ranges [[start,end],...]. Empty input -> [].
 Example: [3,1,2,2,7] -> [[1,3],[7,7]]. Negatives are valid.
 Use only Python standard library. Do not modify TASK.md. No network needed.
-Run public_test.py to check the public example. Hidden evaluation is external.
+First run `python public_test.py` to locate the bug in the noisy diagnostic log.
+This diagnostic reporter deliberately exits zero; read its ERROR/PASS line.
+Fix solution.py, rerun the reporter. Hidden evaluation is external.
 '''
-STARTER = 'import json, sys\nvalues = json.load(sys.stdin)\nprint(json.dumps([]))\n'
+STARTER = 'import json,sys\nr=[]\nfor v in sorted(json.load(sys.stdin)):\n if r and r[-1][1]+1==v: r[-1][1]=v\n else: r.append([v,v])\nprint(json.dumps(r))\n'
 
 
 def prepare(root):
@@ -126,7 +128,11 @@ def prepare(root):
     (work / 'public_test.py').write_text(
         'import json, subprocess, sys\n'
         'p = subprocess.run([sys.executable, "solution.py"], input="[3,1,2,2,7]", text=True, capture_output=True)\n'
-        'assert p.returncode == 0 and json.loads(p.stdout) == [[1,3],[7,7]]\n', encoding='utf-8')
+        'print("diagnostic setup\\n" * 650, end="")\n'
+        'try: ok = p.returncode == 0 and json.loads(p.stdout) == [[1,3],[7,7]]\n'
+        'except ValueError: ok = False\n'
+        'print("PASS public example" if ok else "ERROR solution.py:4: duplicate input creates overlapping ranges")\n'
+        'print("diagnostic cleanup\\n" * 650, end="")\n', encoding='utf-8')
     return work
 
 
@@ -191,6 +197,22 @@ def grade(work):
             'correct': correct, 'integrity': intact}
 
 
+def plugin_metrics(file):
+    """Metrics are optional numeric evidence, never raw agent content."""
+    try:
+        metrics = [json.loads(line) for line in file.read_text(encoding='utf-8').splitlines()]
+        if not metrics or any(not isinstance(m, dict) or
+            any(type(m.get(k)) is not int or m[k] < 0 for k in ('input_chars','output_chars')) or
+            type(m.get('reduced')) is not bool for m in metrics):
+            return {}
+        return {'plugin_events':len(metrics),
+                'plugin_input_chars':sum(m['input_chars'] for m in metrics),
+                'plugin_output_chars':sum(m['output_chars'] for m in metrics),
+                'plugin_reduced_events':sum(m['reduced'] for m in metrics)}
+    except (OSError, ValueError):
+        return {}
+
+
 def report(root, rows):
     (root / 'results.json').write_text(json.dumps(rows, indent=2), encoding='utf-8')
     with (root / 'results.csv').open('w', newline='', encoding='utf-8') as f:
@@ -199,17 +221,26 @@ def report(root, rows):
         for row in rows:
             writer.writerow({k: 'unknown' if v is None else v for k, v in row.items()})
     passed = sum(row['status'] == 'passed' for row in rows)
-    text = f'# Baseline report\n\n{passed}/{len(rows)} passed (failures included).\n\n'
-    text += 'Unknown token usage is not zero. No optimized comparison exists.\n'
-    text += '\n| Trial | Status | Seconds | Tokens | Tests |\n|---|---|---|---|---|\n'
+    text = f'# Tool-output experiment report\n\n{passed}/{len(rows)} passed (failures included).\n\n'
+    text += 'Unknown token usage/metrics is not zero. Compare task quality before timing; no speed conclusion is automatic.\n'
+    for variant in ('baseline', 'compact'):
+        selected = [r for r in rows if r.get('variant', 'baseline') == variant]
+        if selected:
+            text += f'\n{variant}: {sum(r["status"] == "passed" for r in selected)}/{len(selected)} passed (all failures retained).\n'
+    text += '\n| Trial | Variant | Status | Seconds | Tokens | Tests | Plugin events | Input chars | Output chars | Reduced events |\n|---|---|---|---|---|---|---|---|---|---|\n'
     for row in rows:
-        text += f"| {row['trial']} | {row['status']} | {row['seconds']} | {row['tokens'] if row['tokens'] is not None else 'unknown'} | {row['correct']}/{row['total']} |\n"
+        cells = [row['trial'], row.get('variant', 'baseline'), row['status'], row['seconds'],
+                 row['tokens'], f"{row['correct']}/{row['total']}",
+                 *(row.get(key) for key in ('plugin_events','plugin_input_chars',
+                                           'plugin_output_chars','plugin_reduced_events'))]
+        text += '| ' + ' | '.join('unknown' if value is None else str(value) for value in cells) + ' |\n'
     (root / 'REPORT.md').write_text(text, encoding='utf-8')
 
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['doctor','prepare','preview','run','report'])
+    p.add_argument('command', choices=['doctor','prepare','preview','run','compare','report'])
+    p.add_argument('--variant', choices=['baseline','compact'], default='baseline')
     p.add_argument('--execute', action='store_true', help='authorize model calls and auto-approved tools; NOT a sandbox')
     p.add_argument('--model', help='exact API model ID, without lab/ prefix')
     p.add_argument('--base-url', help='OpenAI-compatible endpoint including /v1 if needed')
@@ -250,19 +281,19 @@ def main(argv=None):
         report(root, rows)
         print(f'Regenerated report from {len(rows)} recorded trials.')
         return 0
-    if a.command == 'run' and not a.execute:
+    if a.command in ('run','compare') and not a.execute:
         print('DRY RUN: no processes, model calls, or files. Use --execute in a disposable VM.\n'
               'Plan: exact version check -> fresh state/workspace per trial -> real OpenCode -> external grader -> JSON/CSV/report.\n'
-              f'Budget: {a.timeout}s, {a.max_steps} steps, {a.repeats} trials; tokens unknown until measured.')
+              f'Budget: {a.timeout}s, {a.max_steps} steps, {a.repeats * (2 if a.command == "compare" else 1)} trials; tokens unknown until measured.')
         return 0
-    if not a.model or not a.base_url or (a.command == 'run' and not a.runtime):
+    if not a.model or not a.base_url or (a.command in ('run','compare') and not a.runtime):
         p.error('model, base-url, and (for execution) runtime are required')
     url = urlsplit(a.base_url)
     if url.scheme not in ('http','https') or not url.hostname or url.username or url.password or url.query or url.fragment:
         p.error('base-url must be HTTP(S), without credentials/query/fragment')
     if any(c in a.model + a.base_url for c in '{}\r\n'):
         p.error('config substitutions/control characters are not allowed')
-    cfg = config(a.model, a.base_url, a.max_steps)
+    cfg = config(a.model, a.base_url, a.max_steps, a.variant)
     if a.command == 'preview':
         print(json.dumps(cfg, indent=2))
         return 0
@@ -271,12 +302,17 @@ def main(argv=None):
     metadata = {'model':a.model, 'base_url':a.base_url, 'runtime':a.runtime,
                 'opencode_version':VERSION, 'timeout':a.timeout, 'max_steps':a.max_steps,
                 'repeats':a.repeats, 'cache':'fresh OpenCode state; server cache uncontrolled',
-                'task':'ranges-v1', 'python':sys.version.split()[0], 'platform':sys.platform}
+                'task':'ranges-noisy-bugfix-v2', 'variants':['baseline','compact'] if a.command == 'compare' else [a.variant], 'comparison':a.command == 'compare', 'python':sys.version.split()[0], 'platform':sys.platform}
     (root / 'manifest.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     rows = []
-    for index in range(a.repeats):
+    schedule = []
+    for i in range(a.repeats):
+        variants = ['baseline','compact'] if i % 2 == 0 else ['compact','baseline']
+        schedule.extend((i, v) for v in (variants if a.command == 'compare' else [a.variant]))
+    for index, variant in schedule:
+        cfg = config(a.model, a.base_url, a.max_steps, variant)
         start = time.monotonic()
-        row = {'trial':index+1, 'status':'launch_error', 'seconds':0,
+        row = {'trial':index+1, 'variant':variant, 'plugin_events':None, 'plugin_input_chars':None, 'plugin_output_chars':None, 'plugin_reduced_events':None, 'status':'launch_error', 'seconds':0,
                'tokens':None, 'tool_events':0, 'correct':0, 'total':6, 'exit_code':None}
         try:
             with tempfile.TemporaryDirectory(prefix='opencode-lab-') as d:
@@ -284,6 +320,7 @@ def main(argv=None):
                 work = prepare(trial / 'task')
                 env = environment(trial / 'isolated', os.environ.get(a.key_env, ''))
                 env['OPENCODE_CONFIG_CONTENT'] = json.dumps(cfg)
+                env['OPENCODE_COMPACT_STATE'] = str(trial / 'compact-state')
                 command = resolve_command(a.opencode)
                 version = process(command + ['--version'], work, env, min(a.timeout, 30))
                 if version['status'] != 'ok' or version['stdout'].strip() != VERSION:
@@ -292,6 +329,9 @@ def main(argv=None):
                     result = process(command + ['run', '--format', 'json', '--agent', 'build',
                         '--model', 'lab/' + a.model, 'Read TASK.md and implement solution.py. Check public_test.py.'], work, env, a.timeout)
                     summary = events(result['stdout'])
+                    metrics_path = trial / 'compact-state' / 'metrics.jsonl'
+                    if variant == 'compact':
+                        row.update(plugin_metrics(metrics_path))
                     row.update(tokens=summary['tokens'], tool_events=summary['tool_events'], exit_code=result['code'])
                     row['status'] = result['status']
                     if row['status'] == 'ok':
