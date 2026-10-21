@@ -1,0 +1,15 @@
+{
+  "status": "PLANNED_NOT_VALIDATED",
+  "purpose": "Stage 2 experiment checklist, NOT an OpenCode config or runnable profile",
+  "model_id": null,
+  "base_url": null,
+  "runtime_version": null,
+  "quantization": null,
+  "chat_template": null,
+  "context_window": null,
+  "sampling": null,
+  "tool_call_parser": null,
+  "reasoning_parser": null,
+  "baseline_report": null,
+  "acceptance": "Same model/endpoint/tasks/budget; no pass-rate regression; measured parser failures and latency/tokens"
+}
